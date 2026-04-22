@@ -1,0 +1,11 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "command": "python ${CLAUDE_PLUGIN_ROOT}/skills/scalemaker-bootstrap/scripts/bootstrap.py --sync-on-start",
+        "timeout": 15,
+        "description": "Check for Scalemaker Platform skill updates and sync if needed. Fails silently."
+      }
+    ]
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "name": "scalemaker",
+  "version": "1.0.0",
+  "description": "Scalemaker Platform skill CDN — AI-powered marketing creative workflows for Claude Code",
+  "author": {
+    "name": "Scalemaker Platform",
+    "email": "support@scalemaker.com",
+    "url": "https://scalemaker.com"
+  },
+  "homepage": "https://github.com/scalemaker/scalemaker-plugin",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/scalemaker/scalemaker-plugin.git"
+  },
+  "license": "Proprietary",
+  "keywords": ["scalemaker", "marketing", "creatives", "mcp", "skills", "nano-banana", "gemini"],
+  "entries": {
+    "skills": ["skills/scalemaker-bootstrap"],
+    "hooks": ["hooks/session-start.json"],
+    "commands": ["commands/scalemaker-setup.md"]
+  }
+}

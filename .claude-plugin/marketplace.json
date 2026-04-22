@@ -1,0 +1,15 @@
+{
+  "$schema": "https://claudecode.io/schemas/marketplace.json",
+  "name": "scalemaker",
+  "version": "1.0.0",
+  "displayName": "Scalemaker Platform — Marketing Creatives",
+  "description": "Generate product-aware marketing creatives in Claude Code. Wrapper APIs for Nano Banana (images), Gemini (text), Meta Ads (performance), with automatic skill sync.",
+  "categories": ["marketing", "creative", "ai", "image-generation"],
+  "icon": "https://scalemaker.com/logo.png",
+  "screenshots": [],
+  "author": "Scalemaker Platform",
+  "authorUrl": "https://scalemaker.com",
+  "license": "Proprietary",
+  "minClaudeCodeVersion": "2.0.0",
+  "tags": ["nano-banana", "gemini", "meta-ads", "shopify", "skills", "mcp"]
+}

@@ -29,6 +29,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,9 @@ SCALEMAKER_DIR = HOME / ".claude" / "scalemaker"
 TOKEN_FILE = SCALEMAKER_DIR / "token"
 CONFIG_FILE = SCALEMAKER_DIR / "config.json"
 LOCKFILE = SCALEMAKER_DIR / "sync.lock"
+BRAND_DIR = SCALEMAKER_DIR / "brand"
+BRAND_LOCKFILE = BRAND_DIR / ".lock"
+CLIENT_ID_FILE = SCALEMAKER_DIR / "client.id"
 WORKFLOW_REGISTRY = SCALEMAKER_DIR / "workflow-registry.json"
 SKILLS_DIR = HOME / ".claude" / "skills"
 SETTINGS_FILE = HOME / ".claude" / "settings.json"
@@ -44,6 +48,8 @@ SETTINGS_FILE = HOME / ".claude" / "settings.json"
 DEFAULT_MCP_URL = "https://mcp.scalemaker.frondorf.co"
 SYNC_TIMEOUT = 15.0
 SESSION_START_TIMEOUT = 10.0
+
+CLIENT_VERSION = "0.4.0"
 
 
 def load_config() -> dict[str, Any]:
@@ -96,6 +102,86 @@ def _http_get(url: str, token: str, *, timeout: float = SYNC_TIMEOUT) -> bytes:
 def _http_json(url: str, token: str, *, timeout: float = SYNC_TIMEOUT) -> Any:
     raw = _http_get(url, token, timeout=timeout)
     return json.loads(raw.decode("utf-8"))
+
+
+def _http_post_json(url: str, token: str, payload: dict[str, Any], *, timeout: float) -> None:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    ctx = ssl.create_default_context()
+    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+        resp.read()
+
+
+def client_id() -> str:
+    """Return the stable install UUID, generating it on first call."""
+    if CLIENT_ID_FILE.exists():
+        try:
+            value = CLIENT_ID_FILE.read_text().strip()
+            if value:
+                return value
+        except OSError:
+            pass
+    SCALEMAKER_DIR.mkdir(parents=True, exist_ok=True)
+    new_id = str(uuid.uuid4())
+    try:
+        CLIENT_ID_FILE.write_text(new_id + "\n")
+        CLIENT_ID_FILE.chmod(0o600)
+    except OSError:
+        pass
+    return new_id
+
+
+def emit_event(
+    token: str,
+    base: str,
+    event_type: str,
+    *,
+    event_status: str = "ok",
+    payload: dict[str, Any] | None = None,
+    error_message: str | None = None,
+    silent: bool = True,
+) -> None:
+    """Fire-and-forget client event. Never raises; failures are swallowed silently."""
+    try:
+        _http_post_json(
+            f"{base}/v1/client/event",
+            token,
+            {
+                "client_id": client_id(),
+                "client_version": CLIENT_VERSION,
+                "event_type": event_type,
+                "event_status": event_status,
+                "payload": payload or {},
+                "error_message": error_message,
+            },
+            timeout=SESSION_START_TIMEOUT,
+        )
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, json.JSONDecodeError) as exc:
+        if not silent:
+            print(f"WARN: emit_event({event_type}) failed: {exc}", file=sys.stderr)
+
+
+def load_brand_lock() -> dict[str, Any]:
+    if BRAND_LOCKFILE.exists():
+        try:
+            return json.loads(BRAND_LOCKFILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {"entries": {}}
+    return {"entries": {}}
+
+
+def save_brand_lock(data: dict[str, Any]) -> None:
+    BRAND_DIR.mkdir(parents=True, exist_ok=True)
+    BRAND_LOCKFILE.write_text(json.dumps(data, indent=2))
 
 
 def load_lockfile() -> dict[str, Any]:
@@ -160,26 +246,62 @@ def sync_skills(*, silent: bool = False, timeout: float = SYNC_TIMEOUT) -> int:
     lock = load_lockfile()
     registry = load_registry()
 
+    emit_event(token, base, "sync_start")
+
+    # Fetch brand pack first so requires_brand checks have data.
+    brand_keys = sync_brand(token, base, timeout=timeout, silent=silent)
+
     try:
         resp = _http_json(f"{base}/v1/skills/", token, timeout=timeout)
     except (urllib.error.URLError, urllib.error.HTTPError, OSError, json.JSONDecodeError) as exc:
         if not silent:
             print(f"WARN: Could not reach Scalemaker Platform ({exc}). Using cached skills.", file=sys.stderr)
+        emit_event(
+            token, base, "error",
+            event_status="error",
+            payload={"context": "skill_list_fetch"},
+            error_message=str(exc),
+        )
         return 0
 
-    packages = resp.get("skills", []) if isinstance(resp, dict) else resp
+    if isinstance(resp, dict):
+        packages = resp.get("packages") or resp.get("skills") or []
+    else:
+        packages = resp or []
     if not isinstance(packages, list):
         return 0
 
     installed = 0
+    skipped = 0
+    missing_brand_for: list[dict[str, Any]] = []
     for pkg in packages:
         slug = pkg.get("slug")
         version = pkg.get("version")
         if not slug or not version:
             continue
+
+        manifest = pkg.get("manifest_json") or {}
+        required = manifest.get("requires_brand") or []
+        missing = [k for k in required if k not in brand_keys]
+        if missing:
+            missing_brand_for.append({"slug": slug, "missing": missing})
+            emit_event(
+                token, base, "error",
+                event_status="error",
+                payload={"context": "requires_brand", "slug": slug, "missing": missing},
+                error_message=f"Skill {slug} requires brand keys {missing}",
+            )
+            continue
+
         current = lock.get("packages", {}).get(slug, {})
         if current.get("version") == version and current.get("checksum") == pkg.get("checksum_sha256"):
+            emit_event(
+                token, base, "skill_update_skipped",
+                payload={"slug": slug, "version": version},
+            )
+            skipped += 1
             continue
+
         if _install_package(base, token, pkg, timeout=timeout, silent=silent):
             installed += 1
             lock.setdefault("packages", {})[slug] = {
@@ -187,7 +309,6 @@ def sync_skills(*, silent: bool = False, timeout: float = SYNC_TIMEOUT) -> int:
                 "checksum": pkg.get("checksum_sha256"),
                 "installed_at": int(time.time()),
             }
-            manifest = pkg.get("manifest_json") or {}
             routing = manifest.get("routing") or {}
             if routing:
                 registry.setdefault("workflows", {})[slug] = {
@@ -196,13 +317,95 @@ def sync_skills(*, silent: bool = False, timeout: float = SYNC_TIMEOUT) -> int:
                     "include_keywords": routing.get("include_keywords", []),
                     "exclude_keywords": routing.get("exclude_keywords", []),
                 }
+            emit_event(
+                token, base, "skill_installed",
+                payload={
+                    "slug": slug,
+                    "from_version": current.get("version"),
+                    "to_version": version,
+                },
+            )
 
     save_lockfile(lock)
     save_registry(registry)
 
+    emit_event(
+        token, base, "sync_complete",
+        payload={
+            "installed": installed,
+            "skipped": skipped,
+            "brand_keys": sorted(brand_keys),
+            "missing_brand_for": missing_brand_for,
+        },
+    )
+
     if installed and not silent:
         print(f"Scalemaker Platform: synced {installed} skill(s).")
     return 0
+
+
+def sync_brand(token: str, base: str, *, timeout: float, silent: bool) -> set[str]:
+    """Sync tenant brand pack to ~/.claude/scalemaker/brand/. Returns the set of known keys."""
+    try:
+        resp = _http_json(f"{base}/v1/brand/", token, timeout=timeout)
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, json.JSONDecodeError) as exc:
+        if not silent:
+            print(f"WARN: Could not reach brand API ({exc}). Using cached brand pack.", file=sys.stderr)
+        emit_event(
+            token, base, "error",
+            event_status="error",
+            payload={"context": "brand_list_fetch"},
+            error_message=str(exc),
+        )
+        local_lock = load_brand_lock()
+        return set(local_lock.get("entries", {}).keys())
+
+    entries = resp.get("entries", []) if isinstance(resp, dict) else []
+    if not isinstance(entries, list):
+        return set()
+
+    BRAND_DIR.mkdir(parents=True, exist_ok=True)
+    lock = load_brand_lock()
+    known: set[str] = set()
+    for entry in entries:
+        key = entry.get("key")
+        checksum = entry.get("checksum_sha256") or entry.get("checksum")
+        if not key or not checksum:
+            continue
+        known.add(key)
+        current = lock.get("entries", {}).get(key, {})
+        if current.get("checksum") == checksum:
+            continue
+        try:
+            doc = _http_json(f"{base}/v1/brand/{key}", token, timeout=timeout)
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError, json.JSONDecodeError) as exc:
+            if not silent:
+                print(f"WARN: Failed to fetch brand/{key}: {exc}", file=sys.stderr)
+            emit_event(
+                token, base, "error",
+                event_status="error",
+                payload={"context": "brand_fetch", "key": key},
+                error_message=str(exc),
+            )
+            continue
+
+        value = doc.get("value") if isinstance(doc, dict) else None
+        if value is None:
+            continue
+        target = BRAND_DIR / f"{key}.json"
+        body = json.dumps(value, indent=2, ensure_ascii=False)
+        target.write_text(body)
+        lock.setdefault("entries", {})[key] = {
+            "checksum": checksum,
+            "fetched_at": int(time.time()),
+        }
+        emit_event(
+            token, base, "brand_fetched",
+            payload={"key": key, "size_bytes": len(body.encode("utf-8"))},
+        )
+
+    save_brand_lock(lock)
+    return known
 
 
 def _install_package(base: str, token: str, pkg: dict, *, timeout: float, silent: bool) -> bool:
@@ -289,6 +492,16 @@ def setup(token: str) -> int:
     except OSError as exc:
         print(f"ERROR: Could not write {SETTINGS_FILE}: {exc}", file=sys.stderr)
         return 1
+    # Ensure client.id exists so subsequent events are correlated.
+    client_id()
+
+    base = url.rstrip("/").replace("/mcp", "")
+    emit_event(
+        token, base, "setup",
+        payload={"os": sys.platform, "python": sys.version.split()[0]},
+        silent=False,
+    )
+
     print("Scalemaker Platform: performing initial skill sync...")
     sync_skills(silent=False, timeout=SYNC_TIMEOUT)
     print("Scalemaker Platform configured. Restart Claude Code to activate.")
@@ -307,7 +520,14 @@ def sync_on_start() -> int:
 def route_query(query: str) -> int:
     registry = load_registry()
     slug, confidence = match_workflow(registry, query)
+    token = load_token()
+    base = mcp_url().rstrip("/").replace("/mcp", "")
     if slug and confidence >= 3.0:
+        if token:
+            emit_event(
+                token, base, "query_match",
+                payload={"matched_slug": slug, "score": confidence},
+            )
         sync_skills(silent=True, timeout=SESSION_START_TIMEOUT)
         skill_md = SKILLS_DIR / slug / "SKILL.md"
         if skill_md.exists():
